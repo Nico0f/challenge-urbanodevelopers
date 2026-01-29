@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:14.4-alpine
+    container_name: billing_challenge_db
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=billing_challenge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - billing_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: billing_challenge_api
+    ports:
+      - "3057:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src
+      - node_modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - billing_network
+    command: npm run start:dev
+
+volumes:
+  postgres_data:
+    driver: local
+  node_modules:
+    driver: local
+
+networks:
+  billing_network:
+    driver: bridge
