@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, Between } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue, Job } from 'bull';
 import { BillingBatch, BatchStatus } from '../entities/billing-batch.entity';
 import { Invoice } from '../entities/invoice.entity';
 import { BillingPending, PendingStatus } from '../entities/billing-pending.entity';
@@ -16,6 +18,7 @@ import {
   BatchProcessingException,
 } from '../common';
 import { BillingPendingService } from '../billing-pending/billing-pending.service';
+import { BILLING_BATCH_QUEUE, BillingBatchJobData, BillingBatchJobResult } from '../queue/billing-batch.processor';
 
 @Injectable()
 export class BillingBatchService {
@@ -32,9 +35,91 @@ export class BillingBatchService {
     private readonly serviceRepository: Repository<Service>,
     private readonly billingPendingService: BillingPendingService,
     private readonly dataSource: DataSource,
+    @InjectQueue(BILLING_BATCH_QUEUE)
+    private readonly billingBatchQueue: Queue<BillingBatchJobData>,
   ) {}
 
+  /**
+   * Creates a new billing batch and queues it for async processing
+   */
   async create(createBatchDto: CreateBillingBatchDto): Promise<BatchCreationResultDto> {
+    const { issueDate, receiptBook, pendingIds } = createBatchDto;
+
+    if (!pendingIds || pendingIds.length === 0) {
+      throw new EmptyBatchException();
+    }
+
+    // Pre-validate pendings (just to give immediate feedback)
+    const { valid, invalid } = await this.billingPendingService.validatePendingsForBilling(pendingIds);
+
+    if (valid.length === 0) {
+      throw new EmptyBatchException();
+    }
+
+    // Create the batch record with PENDING_PROCESSING status
+    const batch = this.batchRepository.create({
+      issueDate: new Date(issueDate),
+      receiptBook,
+      status: BatchStatus.PENDING_PROCESSING,
+      pendingIds: pendingIds,
+    });
+
+    const savedBatch = await this.batchRepository.save(batch);
+
+    this.logger.log(`Batch ${savedBatch.id} created and queued for processing`);
+
+    // Queue the batch for async processing
+    const job = await this.billingBatchQueue.add(
+      {
+        batchId: savedBatch.id,
+        pendingIds: valid.map(p => p.id),
+        issueDate,
+        receiptBook,
+      },
+      {
+        jobId: `batch-${savedBatch.id}`,
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 2000,
+        },
+      },
+    );
+
+    this.logger.log(`Job ${job.id} queued for batch ${savedBatch.id}`);
+
+    // Return immediately with the batch info and queue status
+    return {
+      batch: {
+        id: savedBatch.id,
+        issueDate: savedBatch.issueDate,
+        receiptBook: savedBatch.receiptBook,
+        status: savedBatch.status,
+        errorMessage: null,
+        invoices: [],
+        totalInvoices: 0,
+        totalAmount: 0,
+        createdAt: savedBatch.createdAt,
+        updatedAt: savedBatch.updatedAt,
+      },
+      summary: {
+        totalInvoices: 0, // Will be updated after processing
+        totalAmount: 0, // Will be updated after processing
+        successfulPendings: [],
+        failedPendings: invalid,
+      },
+      queueInfo: {
+        jobId: String(job.id),
+        status: 'queued',
+        message: `Batch ${savedBatch.id} has been queued for processing. Check status at GET /billing-batches/${savedBatch.id}/status`,
+      },
+    };
+  }
+
+  /**
+   * Creates a batch and processes it synchronously (legacy behavior)
+   */
+  async createSync(createBatchDto: CreateBillingBatchDto): Promise<BatchCreationResultDto> {
     const { issueDate, receiptBook, pendingIds } = createBatchDto;
 
     if (!pendingIds || pendingIds.length === 0) {
@@ -121,7 +206,7 @@ export class BillingBatchService {
       await queryRunner.commitTransaction();
 
       this.logger.log(
-        `Billing batch ${savedBatch.id} created with ${createdInvoices.length} invoices`,
+        `Billing batch ${savedBatch.id} created (sync) with ${createdInvoices.length} invoices`,
       );
 
       // Reload batch with invoices
@@ -146,6 +231,102 @@ export class BillingBatchService {
     } finally {
       await queryRunner.release();
     }
+  }
+
+  /**
+   * Get the processing status of a batch
+   */
+  async getBatchStatus(id: number): Promise<{
+    batch: BillingBatch;
+    jobInfo: {
+      jobId: string;
+      status: string;
+      progress: number;
+      attemptsMade: number;
+      failedReason?: string;
+    } | null;
+  }> {
+    const batch = await this.findOne(id);
+
+    // Try to find the job in the queue
+    const job = await this.billingBatchQueue.getJob(`batch-${id}`);
+
+    let jobInfo = null;
+    if (job) {
+      const state = await job.getState();
+      jobInfo = {
+        jobId: String(job.id),
+        status: state,
+        progress: job.progress() as number,
+        attemptsMade: job.attemptsMade,
+        failedReason: job.failedReason,
+      };
+    }
+
+    return { batch, jobInfo };
+  }
+
+  /**
+   * Get queue statistics
+   */
+  async getQueueStats(): Promise<{
+    waiting: number;
+    active: number;
+    completed: number;
+    failed: number;
+    delayed: number;
+  }> {
+    const [waiting, active, completed, failed, delayed] = await Promise.all([
+      this.billingBatchQueue.getWaitingCount(),
+      this.billingBatchQueue.getActiveCount(),
+      this.billingBatchQueue.getCompletedCount(),
+      this.billingBatchQueue.getFailedCount(),
+      this.billingBatchQueue.getDelayedCount(),
+    ]);
+
+    return { waiting, active, completed, failed, delayed };
+  }
+
+  /**
+   * Retry a failed batch
+   */
+  async retryBatch(id: number): Promise<{ message: string; jobId: string }> {
+    const batch = await this.findOne(id);
+
+    if (batch.status !== BatchStatus.ERROR) {
+      throw new BatchProcessingException(
+        `Cannot retry batch in status '${batch.status}'. Only ERROR batches can be retried.`,
+      );
+    }
+
+    // Reset batch status
+    await this.batchRepository.update(id, {
+      status: BatchStatus.PENDING_PROCESSING,
+      errorMessage: null,
+      processingStartedAt: null,
+      processingCompletedAt: null,
+    });
+
+    // Queue for reprocessing
+    const job = await this.billingBatchQueue.add(
+      {
+        batchId: batch.id,
+        pendingIds: batch.pendingIds || [],
+        issueDate: batch.issueDate.toISOString().split('T')[0],
+        receiptBook: batch.receiptBook,
+      },
+      {
+        jobId: `batch-${batch.id}-retry-${Date.now()}`,
+        attempts: 3,
+      },
+    );
+
+    this.logger.log(`Batch ${id} queued for retry with job ${job.id}`);
+
+    return {
+      message: `Batch ${id} has been queued for retry`,
+      jobId: String(job.id),
+    };
   }
 
   async findAll(filterDto: BillingBatchFilterDto): Promise<{
