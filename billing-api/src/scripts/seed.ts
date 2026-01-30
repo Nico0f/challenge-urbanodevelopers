@@ -38,19 +38,19 @@ async function seed() {
       { serviceDate: '2024-01-10', customerId: 1, amount: 2300.50 },
       { serviceDate: '2024-01-15', customerId: 1, amount: 850.00 },
       { serviceDate: '2024-01-20', customerId: 1, amount: 3200.75 },
-      
+
       // Customer 2 - Multiple services
       { serviceDate: '2024-01-08', customerId: 2, amount: 4500.00 },
       { serviceDate: '2024-01-12', customerId: 2, amount: 1200.00 },
       { serviceDate: '2024-01-18', customerId: 2, amount: 2800.25 },
-      
+
       // Customer 3 - Some services
       { serviceDate: '2024-01-06', customerId: 3, amount: 950.00 },
       { serviceDate: '2024-01-14', customerId: 3, amount: 1750.50 },
-      
+
       // Customer 4 - Single service
       { serviceDate: '2024-01-22', customerId: 4, amount: 5000.00 },
-      
+
       // Customer 5 - Multiple services
       { serviceDate: '2024-01-03', customerId: 5, amount: 600.00 },
       { serviceDate: '2024-01-09', customerId: 5, amount: 1100.00 },
@@ -67,6 +67,20 @@ async function seed() {
     }
 
     console.log(`Created ${services.length} sample services`);
+
+    const serviceResults = await queryRunner.query('SELECT id FROM services');
+    for (const service of serviceResults) {
+      await queryRunner.query(
+        `INSERT INTO billing_pendings ("serviceId", "status", "createdAt", "updatedAt")
+     VALUES ($1, 'PENDING', NOW(), NOW())`,
+        [service.id]
+      );
+      await queryRunner.query(
+        `UPDATE services SET status = 'SENT_TO_BILL' WHERE id = $1`,
+        [service.id]
+      );
+    }
+    console.log(`Created ${serviceResults.length} billing pendings`);
 
     await queryRunner.commitTransaction();
     console.log('Seeding completed successfully!');

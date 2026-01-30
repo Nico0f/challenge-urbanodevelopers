@@ -145,11 +145,30 @@ export class BillingBatchResponseDto {
   @ApiProperty({
     example: 'PROCESSED',
     enum: BatchStatus,
+    description: 'Batch processing status: PENDING_PROCESSING, IN_PROCESS, PROCESSED, ERROR',
   })
   status: BatchStatus;
 
   @ApiPropertyOptional({ example: null })
   errorMessage?: string;
+
+  @ApiPropertyOptional({
+    description: 'Processing start timestamp',
+    example: '2024-01-31T10:00:00.000Z',
+  })
+  processingStartedAt?: Date;
+
+  @ApiPropertyOptional({
+    description: 'Processing completion timestamp',
+    example: '2024-01-31T10:00:05.000Z',
+  })
+  processingCompletedAt?: Date;
+
+  @ApiProperty({ example: 3 })
+  totalInvoices: number;
+
+  @ApiProperty({ example: 4500.5 })
+  totalAmount: number;
 
   @ApiProperty({ type: [InvoiceInBatchDto] })
   invoices: InvoiceInBatchDto[];
@@ -178,6 +197,17 @@ export class PaginatedBillingBatchResponseDto {
   totalPages: number;
 }
 
+export class QueueInfoDto {
+  @ApiProperty({ example: 'batch-1' })
+  jobId: string;
+
+  @ApiProperty({ example: 'queued' })
+  status: string;
+
+  @ApiProperty({ example: 'Batch 1 has been queued for processing. Check status at GET /billing-batches/1/status' })
+  message: string;
+}
+
 export class BatchCreationResultDto {
   @ApiProperty({
     description: 'Created batch details',
@@ -200,4 +230,82 @@ export class BatchCreationResultDto {
     successfulPendings: number[];
     failedPendings: { id: number; reason: string }[];
   };
+
+  @ApiPropertyOptional({
+    description: 'Queue information (only for async processing)',
+    type: QueueInfoDto,
+  })
+  queueInfo?: QueueInfoDto;
+}
+
+export class JobInfoDto {
+  @ApiProperty({ example: 'batch-1' })
+  jobId: string;
+
+  @ApiProperty({ 
+    example: 'active',
+    description: 'Job status: waiting, active, completed, failed, delayed',
+  })
+  status: string;
+
+  @ApiProperty({ 
+    example: 75,
+    description: 'Processing progress (0-100)',
+  })
+  progress: number;
+
+  @ApiProperty({ example: 0 })
+  attemptsMade: number;
+
+  @ApiPropertyOptional({ 
+    example: 'Connection timeout',
+    description: 'Error reason if job failed',
+  })
+  failedReason?: string;
+}
+
+export class BatchStatusResponseDto {
+  @ApiProperty({
+    description: 'Batch details',
+    type: BillingBatchResponseDto,
+  })
+  batch: BillingBatchResponseDto;
+
+  @ApiPropertyOptional({
+    description: 'Queue job information (null if job completed or not found)',
+    type: JobInfoDto,
+  })
+  jobInfo: JobInfoDto | null;
+}
+
+export class QueueStatsResponseDto {
+  @ApiProperty({ 
+    example: 5,
+    description: 'Number of jobs waiting to be processed',
+  })
+  waiting: number;
+
+  @ApiProperty({ 
+    example: 2,
+    description: 'Number of jobs currently being processed',
+  })
+  active: number;
+
+  @ApiProperty({ 
+    example: 100,
+    description: 'Number of completed jobs (kept in memory)',
+  })
+  completed: number;
+
+  @ApiProperty({ 
+    example: 3,
+    description: 'Number of failed jobs',
+  })
+  failed: number;
+
+  @ApiProperty({ 
+    example: 0,
+    description: 'Number of delayed jobs',
+  })
+  delayed: number;
 }
